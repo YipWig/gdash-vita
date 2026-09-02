@@ -19,7 +19,25 @@
 // Suppress `mktemp` deprecation warning
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
+#include "utils/trace.h"
 #include "dynlib.h"
+extern int gdash_FMOD_System_createStream(void *this, const char *fname, int mode, void *exinfo, int **sound);
+extern int gdash_FMOD_Sound_getOpenState(void *this, int *openstate, unsigned *pct, char *starving, char *diskbusy);
+extern int gdash_FMOD_System_playSound(void *this, void *sound, void *group, char paused, void **channel);
+extern int gdash_FMOD_setPaused(void *, char);
+extern int gdash_FMOD_getDSPClock(void *, unsigned long long *, unsigned long long *);
+extern int gdash_FMOD_addFadePoint(void *, unsigned long long, float);
+extern int gdash_FMOD_setDelay(void *, unsigned long long, unsigned long long, char);
+extern int gdash_FMOD_setPitch(void *, float);
+extern int gdash_FMOD_mixerSuspend(void *);
+extern int gdash_FMOD_mixerResume(void *);
+extern int gdash_FMOD_setVolumeRamp(void *, char);
+extern int gdash_FMOD_getLength(void *, unsigned *, unsigned);
+extern int gdash_FMOD_setPosition(void *, unsigned, unsigned);
+extern int gdash_FMOD_setVolume(void *, float);
+extern int gdash_FMOD_stop(void *);
+extern int gdash_FMOD_getPosition(void *, unsigned *, unsigned);
+extern int gdash_FMOD_System_createSound(void *this, const char *fname, int mode, void *exinfo, int **sound);
 
 #include <psp2/kernel/clib.h>
 #include <stdio.h>
@@ -35,12 +53,15 @@
 #include <dirent.h>
 #include <locale.h>
 #include <poll.h>
+#include <pthread.h>
 
 #include <sys/stat.h>
 #include <sys/unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/param.h>
+#include <signal.h>
+#include <grp.h>
 
 #include <so_util/so_util.h>
 
@@ -53,12 +74,16 @@
 #endif
 
 #include "reimpl/env.h"
+#include <errno.h>
 #include "reimpl/errno.h"
 #include "reimpl/io.h"
 #include "reimpl/ioctl.h"
 #include "reimpl/log.h"
 #include "reimpl/mem.h"
 #include "reimpl/pthr.h"
+#include "reimpl/sockopt.h"
+#include "reimpl/sockaddr_abi.h"
+#include "reimpl/proc_stubs.h"
 #include "reimpl/sys.h"
 
 #include "fmod_symbols.h"
@@ -197,6 +222,488 @@ void __stack_chk_fail_fake() {
 	logv_debug("stack smashing detected!! on: %p\n", __builtin_return_address(0));
 }
 
+// --- Network call tracing (persistent, non-debug-gated) -------------------
+// The game's own networking (curl statically linked inside libcocos2dcpp.so)
+// calls these directly through the PLT hooks below. Logging what it actually
+// does tells us whether it even tries, and where/how it fails.
+// Serialize our own socket/connect/getaddrinfo import hooks. The loaded
+// .so's statically-linked OpenSSL/BoringSSL performs lazy, NON-thread-safe
+// one-time cipher/digest table initialization (ssl_load_ciphers(), called
+// from an internal SSL_library_init-equivalent routine) the very first
+// time any networking code path is exercised. If two threads both enter
+// that path at nearly the same time (e.g. a background thread opening a
+// connection while the main thread does too), the table can be observed
+// half-populated by one thread while the other clears/rebuilds it,
+// producing a NULL ssl_digest_methods[SSL_MD_MD5_IDX] and a fatal
+// OPENSSL_die() abort deep inside code we cannot hook directly (it's all
+// intra-.so, not imported). We can't patch that code, but we DO own every
+// external entry point that can trigger it -- so force full serialization
+// here as a mitigation for the race.
+static pthread_mutex_t g_net_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static FILE *net_trace_file(void) {
+    static FILE *f = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        f = gdash_trace_fopen("ux0:data/gdash/net_trace.txt", "w");
+    }
+    return f;
+}
+
+int socket_traced(int domain, int type, int protocol) {
+    pthread_mutex_lock(&g_net_hook_mutex);
+    int ret = socket(domain, type, protocol);
+    int sv_errno = errno;
+    FILE *f = net_trace_file();
+    if (f) { fprintf(f, "socket(domain=%d, type=%d, proto=%d) = %d (errno=%d)\n",
+                      domain, type, protocol, ret, sv_errno); fflush(f); }
+    if (ret >= 0) gdash_net_track_fd(ret, 1);
+    pthread_mutex_unlock(&g_net_hook_mutex);
+    errno = sv_errno;
+    return ret;
+}
+
+int connect_traced(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    pthread_mutex_lock(&g_net_hook_mutex);
+    FILE *f = net_trace_file();
+
+    // The loaded .so is unmodified bionic ARM code -- any sockaddr_in it
+    // builds itself (rather than one we handed back via getaddrinfo) uses
+    // bionic's 2-byte sin_family layout, not the Vita's BSD-style
+    // sin_len+sin_family layout. Translate a local copy before touching
+    // sin_family/sin_addr ourselves or handing it to the real connect().
+    char addr_buf[128];
+    const struct sockaddr *real_addr = addr;
+    if (addr && addrlen > 0 && addrlen <= sizeof(addr_buf)) {
+        memcpy(addr_buf, addr, addrlen);
+        sockaddr_bionic_to_vita((struct sockaddr *)addr_buf, addrlen);
+        real_addr = (struct sockaddr *)addr_buf;
+    }
+
+    char ipstr[64] = "?";
+    int port = -1;
+    if (real_addr && real_addr->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)real_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+        port = ntohs(sin->sin_port);
+    }
+    if (f) { fprintf(f, "connect(fd=%d, %s:%d) starting...\n", sockfd, ipstr, port); fflush(f); }
+
+    // DIAGNOSTIC: how long does our own synchronous connect+poll actually
+    // take? If it eats up several seconds of wall-clock time, curl's own
+    // (independent, already-ticking since it queued this transfer)
+    // per-transfer timeout could expire the instant we return "success",
+    // causing it to abort immediately after connect() without ever
+    // attempting the TLS handshake -- which is exactly what we're seeing
+    // (SSL_do_handshake() confirmed never called). Time the whole function
+    // and the poll() call separately.
+    struct timeval t_start, t_before_poll, t_after_poll, t_end;
+    gettimeofday(&t_start, NULL);
+
+    // The game's own non-blocking-connect setup relies on fcntl(), which
+    // (even fixed to use the Vita-correct SO_NONBLOCK sockopt) never even
+    // gets called before connect() -- so connect() runs fully blocking, with
+    // no timeout enforcement of its own, and can hang for a very long time
+    // (BSD default connect timeout) if the remote doesn't respond as
+    // expected. Force our own bounded non-blocking connect + poll here so we
+    // never hang forever regardless of what the caller did/didn't set up.
+    int nonblock = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_NONBLOCK, &nonblock, sizeof(nonblock));
+
+    int ret = connect(sockfd, real_addr, addrlen);
+    int conn_errno = errno;
+
+    if (ret < 0 && conn_errno == EINPROGRESS) {
+        struct pollfd pfd;
+        pfd.fd = sockfd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        gettimeofday(&t_before_poll, NULL);
+        int poll_ret = poll(&pfd, 1, 8000); // 8s bound, instead of forever
+        gettimeofday(&t_after_poll, NULL);
+        long poll_ms = (t_after_poll.tv_sec - t_before_poll.tv_sec) * 1000L
+                     + (t_after_poll.tv_usec - t_before_poll.tv_usec) / 1000L;
+        if (f) { fprintf(f, "  connect in progress, poll() = %d revents=0x%x took=%ldms\n", poll_ret, pfd.revents, poll_ms); fflush(f); }
+
+        if (poll_ret > 0 && (pfd.revents & POLLOUT)) {
+            int so_error = 0;
+            socklen_t elen = sizeof(so_error);
+            getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &elen);
+            if (so_error == 0) {
+                ret = 0;
+            } else {
+                ret = -1;
+                conn_errno = so_error;
+            }
+        } else {
+            ret = -1;
+            conn_errno = ETIMEDOUT;
+        }
+    }
+
+    // Restore blocking mode -- the caller (curl) still thinks it never
+    // changed, and later send()/recv() calls expect the mode it originally
+    // set (or didn't set, i.e. blocking).
+    nonblock = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_NONBLOCK, &nonblock, sizeof(nonblock));
+
+    gettimeofday(&t_end, NULL);
+    long total_ms = (t_end.tv_sec - t_start.tv_sec) * 1000L
+                   + (t_end.tv_usec - t_start.tv_usec) / 1000L;
+    if (f) {
+        fprintf(f, "connect(fd=%d, %s:%d) = %d (errno=%d) total_took=%ldms\n", sockfd, ipstr, port, ret, conn_errno, total_ms);
+        fflush(f);
+    }
+    errno = conn_errno;
+    pthread_mutex_unlock(&g_net_hook_mutex);
+    return ret;
+}
+
+int getaddrinfo_traced(const char *node, const char *service,
+                        const struct addrinfo *hints, struct addrinfo **res) {
+    pthread_mutex_lock(&g_net_hook_mutex);
+    int ret = getaddrinfo(node, service, hints, res);
+    // The Vita's getaddrinfo() fills sockaddr_in with BSD-style
+    // sin_len+sin_family; the loaded bionic .so expects plain 2-byte
+    // sin_family. Without this translation every resolved address looks
+    // like garbage to the game and gets silently discarded/retried.
+    if (ret == 0 && res && *res) {
+        addrinfo_list_vita_to_bionic(*res);
+    }
+    int sv_errno = errno;
+    FILE *f = net_trace_file();
+    if (f) { fprintf(f, "getaddrinfo(node=%s, service=%s) = %d (errno=%d)\n",
+                      node ? node : "(null)", service ? service : "(null)", ret, sv_errno); fflush(f); }
+    pthread_mutex_unlock(&g_net_hook_mutex);
+    errno = sv_errno;
+    return ret;
+}
+
+struct hostent *gethostbyname_traced(const char *name) {
+    struct hostent *ret = gethostbyname(name);
+    FILE *f = net_trace_file();
+    if (f) { fprintf(f, "gethostbyname(name=%s) = %p (errno=%d)\n",
+                      name ? name : "(null)", (void*)ret, errno); fflush(f); }
+    return ret;
+}
+
+// Bionic MSG_* flag values differ from the Vita's (newlib) ones, and
+// libcurl's plain-HTTP send path always passes MSG_NOSIGNAL (bionic
+// 0x4000), which sceNet does not know at all -> send() failed with
+// errno 106 and curl reported "Send failure" on every Newgrounds song
+// download (audio.ngfiles.com is plain HTTP). Translate the flags we can
+// and drop the ones that have no Vita equivalent.
+static int msg_flags_bionic_to_vita(int b) {
+    int v = 0;
+    if (b & 0x01)  v |= MSG_OOB;
+    if (b & 0x02)  v |= MSG_PEEK;
+    if (b & 0x40)  v |= MSG_DONTWAIT;   // bionic MSG_DONTWAIT
+    if (b & 0x100) v |= MSG_WAITALL;    // bionic MSG_WAITALL
+    // 0x4000 MSG_NOSIGNAL, 0x8000 MSG_MORE, 0x20 MSG_TRUNC, ...: dropped
+    return v;
+}
+
+ssize_t send_traced(int sockfd, const void *buf, size_t len, int flags) {
+    ssize_t ret = send(sockfd, buf, len, msg_flags_bionic_to_vita(flags));
+    FILE *f = net_trace_file();
+    if (f) { fprintf(f, "send(fd=%d, len=%u, flags=0x%x) = %d (errno=%d)\n", sockfd, (unsigned)len, flags, (int)ret, errno); fflush(f); }
+    return ret;
+}
+
+ssize_t recv_traced(int sockfd, void *buf, size_t len, int flags) {
+    ssize_t ret = recv(sockfd, buf, len, msg_flags_bionic_to_vita(flags));
+    FILE *f = net_trace_file();
+    if (f) { fprintf(f, "recv(fd=%d, len=%u, flags=0x%x) = %d (errno=%d)\n", sockfd, (unsigned)len, flags, (int)ret, errno); fflush(f); }
+    return ret;
+}
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Tracked-socket-fd set (see dynlib.h). The game's TLS/HTTP layer never
+// showed up calling our traced send()/recv() at all (net_trace.txt has zero
+// send/recv lines across the whole repeated-connect-cycle hang on the
+// profile screen) -- so it must be using read()/write() on the socket fd
+// instead. Those import slots are shared with ALL file I/O, so we only log
+// when the fd is a known socket, tracked here.
+#define GDASH_MAX_TRACKED_FDS 32
+static int g_tracked_fds[GDASH_MAX_TRACKED_FDS];
+static pthread_mutex_t g_tracked_fds_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void gdash_net_track_fd(int fd, int is_socket) {
+    pthread_mutex_lock(&g_tracked_fds_mutex);
+    if (is_socket) {
+        int slot = -1;
+        for (int i = 0; i < GDASH_MAX_TRACKED_FDS; i++) {
+            if (g_tracked_fds[i] == fd) { slot = -2; break; } // already tracked
+            if (slot < 0 && g_tracked_fds[i] == 0) slot = i;
+        }
+        if (slot >= 0) g_tracked_fds[slot] = fd + 1; // +1 so fd=0 isn't confused with "empty"
+    } else {
+        for (int i = 0; i < GDASH_MAX_TRACKED_FDS; i++) {
+            if (g_tracked_fds[i] == fd + 1) { g_tracked_fds[i] = 0; break; }
+        }
+    }
+    pthread_mutex_unlock(&g_tracked_fds_mutex);
+}
+
+int gdash_net_is_tracked_fd(int fd) {
+    int found = 0;
+    pthread_mutex_lock(&g_tracked_fds_mutex);
+    for (int i = 0; i < GDASH_MAX_TRACKED_FDS; i++) {
+        if (g_tracked_fds[i] == fd + 1) { found = 1; break; }
+    }
+    pthread_mutex_unlock(&g_tracked_fds_mutex);
+    return found;
+}
+
+
+// inet_pton with bionic address-family constants. Bionic AF_INET6 is 10,
+// Vita/newlib AF_INET6 is 28, so the .so's inet_pton(AF_INET6=10, host)
+// reached the Vita implementation with an unknown family and returned -1
+// (error) instead of 0 ("not an address"). curl only adds the TLS SNI
+// extension when BOTH Curl_inet_pton(AF_INET, host) and
+// Curl_inet_pton(AF_INET6, host) return 0; the stray -1 made it treat
+// "www.boomlings.com" as an IP literal and skip SNI -- the decoded
+// ClientHello (tls_hello.hex) had every extension except server_name,
+// which Cloudflare answers with alert 40 handshake_failure.
+#include <arpa/inet.h>
+int inet_pton_soloader(int af, const char *src, void *dst) {
+    if (!src || !dst) { errno = EINVAL; return -1; }
+    if (af == 2 /* AF_INET, same on both */) {
+        int r = inet_pton(AF_INET, src, dst);
+        return r > 0 ? 1 : 0;
+    }
+    if (af == 10 /* bionic AF_INET6 */) {
+        if (!strchr(src, ':'))
+            return 0;                       // can't be an IPv6 literal
+        int r = inet_pton(AF_INET6, src, dst);
+        return r > 0 ? 1 : 0;
+    }
+    errno = EAFNOSUPPORT;
+    return -1;
+}
+
+ssize_t read_traced(int fd, void *buf, size_t len) {
+    ssize_t ret = read(fd, buf, len);
+    int sv_errno = errno;
+    if (gdash_net_is_tracked_fd(fd)) {
+        FILE *f = net_trace_file();
+        if (f) {
+            fprintf(f, "read(fd=%d, len=%u) = %d (errno=%d)", fd, (unsigned)len, (int)ret, sv_errno);
+            if (ret > 0) {
+                fprintf(f, " bytes[0..%d)=\"", (int)(ret < 32 ? ret : 32));
+                for (ssize_t i = 0; i < ret && i < 32; i++) {
+                    unsigned char c = ((unsigned char *)buf)[i];
+                    fprintf(f, (c >= 32 && c < 127) ? "%c" : "\\x%02x", c);
+                }
+                fprintf(f, "\"");
+            }
+            fprintf(f, "\n");
+            fflush(f);
+        }
+    }
+    errno = sv_errno;
+    return ret;
+}
+
+ssize_t write_traced(int fd, const void *buf, size_t len) {
+    ssize_t ret = write(fd, buf, len);
+    int sv_errno = errno;
+    if (gdash_net_is_tracked_fd(fd)) {
+        FILE *f = net_trace_file();
+        if (f) {
+            fprintf(f, "write(fd=%d, len=%u) = %d (errno=%d)", fd, (unsigned)len, (int)ret, sv_errno);
+            // Full hex dump of TLS handshake records (content type 0x16) so the
+            // ClientHello's cipher suites / extensions (SNI, groups...) can be
+            // decoded offline: Cloudflare answers it with alert 40
+            // (handshake_failure) on every attempt.
+            if (len > 5 && ((const unsigned char *)buf)[0] == 0x16) {
+                FILE *h = gdash_trace_fopen("ux0:data/gdash/tls_hello.hex", "a");
+                if (h) {
+                    fprintf(h, "fd=%d len=%u\n", fd, (unsigned)len);
+                    for (size_t i = 0; i < len && i < 2048; i++) fprintf(h, "%02x", ((const unsigned char *)buf)[i]);
+                    fprintf(h, "\n");
+                    fclose(h);
+                }
+            }
+            if (len > 0) {
+                size_t show = len < 32 ? len : 32;
+                fprintf(f, " bytes[0..%u)=\"", (unsigned)show);
+                for (size_t i = 0; i < show; i++) {
+                    unsigned char c = ((const unsigned char *)buf)[i];
+                    fprintf(f, (c >= 32 && c < 127) ? "%c" : "\\x%02x", c);
+                }
+                fprintf(f, "\"");
+            }
+            fprintf(f, "\n");
+            fflush(f);
+        }
+    }
+    errno = sv_errno;
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Static analysis of the connect()-then-immediately-close() pattern (see
+// close_trace.txt: caller is always so+0x5fb6a3, a generic
+// Close(this,fd)-style helper reached only via a vtable/function-pointer
+// slot -- never a direct "bl", so we can't trace its own caller the same
+// way) turned up a very suggestive detail: a sibling error path in the
+// same source-level function (around so+0x5fa832, right before it grabs
+// that same close vtable slot) sets a fixed value 0x2a (42) into a
+// register that's very plausibly a libcurl CURLcode -- and 42 is exactly
+// CURLE_ABORTED_BY_CALLBACK. That's the code curl returns when its own
+// progress/timeout callback (Curl_now()-based, i.e. driven by
+// clock_gettime(CLOCK_MONOTONIC)/gettimeofday()) decides a transfer should
+// be aborted -- e.g. because it *thinks* a timeout has already elapsed.
+// If the Vita's clock backing these calls ever jumps or misbehaves right
+// after the (real, ~100-300ms) blocking TCP connect our connect_traced
+// performs, curl could see an apparent multi-second/negative jump and
+// immediately abort the request before ever touching the socket for I/O --
+// which matches every single symptom we've seen. Log only suspicious
+// deltas (huge jump or time going backwards) per clock id, so this stays
+// cheap despite clock_gettime/gettimeofday being called every frame.
+static FILE *clock_trace_file(void) {
+    static FILE *f = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        f = gdash_trace_fopen("ux0:data/gdash/clock_trace.txt", "w");
+    }
+    return f;
+}
+
+static void clock_trace_check(const char *who, clockid_t clk_id, long sec, long nsec) {
+    static long last_sec[8] = {0};
+    static long last_nsec[8] = {0};
+    static int have_last[8] = {0};
+    static int logged = 0;
+    int idx = (clk_id >= 0 && clk_id < 8) ? (int)clk_id : 7;
+    long delta_ms = 0;
+    int suspicious = 0;
+    if (have_last[idx]) {
+        long dsec = sec - last_sec[idx];
+        long dnsec = nsec - last_nsec[idx];
+        delta_ms = dsec * 1000 + dnsec / 1000000;
+        if (delta_ms < 0 || delta_ms > 2000) suspicious = 1;
+    } else {
+        have_last[idx] = 1;
+    }
+    last_sec[idx] = sec;
+    last_nsec[idx] = nsec;
+    if (suspicious || logged < 8) {
+        logged++;
+        FILE *f = clock_trace_file();
+        if (f) {
+            fprintf(f, "%s(clk_id=%d) = %ld.%09ld  delta_ms=%ld%s\n",
+                    who, (int)clk_id, sec, nsec, delta_ms, suspicious ? "  <== SUSPICIOUS" : "");
+            fflush(f);
+        }
+    }
+}
+
+int clock_gettime_traced(clockid_t clk_id, struct timespec *tp) {
+    int ret = clock_gettime(clk_id, tp);
+    if (ret == 0 && tp) clock_trace_check("clock_gettime", clk_id, tp->tv_sec, tp->tv_nsec);
+    return ret;
+}
+
+int gettimeofday_traced(struct timeval *tv, void *tz) {
+    int ret = gettimeofday(tv, tz);
+    if (ret == 0 && tv) clock_trace_check("gettimeofday", (clockid_t)6 /* own bucket */, tv->tv_sec, (long)tv->tv_usec * 1000);
+    return ret;
+}
+// ---------------------------------------------------------------------------
+
+ssize_t sendmsg_traced(int sockfd, const struct msghdr *msg, int flags) {
+    ssize_t ret = sendmsg(sockfd, msg, msg_flags_bionic_to_vita(flags));
+    int sv_errno = errno;
+    FILE *f = net_trace_file();
+    if (f) {
+        size_t total_len = 0;
+        if (msg) for (size_t i = 0; i < msg->msg_iovlen; i++) total_len += msg->msg_iov[i].iov_len;
+        fprintf(f, "sendmsg(fd=%d, iovlen=%d, total=%zu) = %zd (errno=%d)\n",
+                sockfd, msg ? (int)msg->msg_iovlen : -1, total_len, ret, sv_errno);
+        fflush(f);
+    }
+    errno = sv_errno;
+    return ret;
+}
+
+ssize_t recvmsg_traced(int sockfd, struct msghdr *msg, int flags) {
+    ssize_t ret = recvmsg(sockfd, msg, msg_flags_bionic_to_vita(flags));
+    int sv_errno = errno;
+    FILE *f = net_trace_file();
+    if (f) {
+        size_t total_len = 0;
+        if (msg) for (size_t i = 0; i < msg->msg_iovlen; i++) total_len += msg->msg_iov[i].iov_len;
+        fprintf(f, "recvmsg(fd=%d, iovlen=%d, total=%zu) = %zd (errno=%d)\n",
+                sockfd, msg ? (int)msg->msg_iovlen : -1, total_len, ret, sv_errno);
+        fflush(f);
+    }
+    errno = sv_errno;
+    return ret;
+}
+// ---------------------------------------------------------------------------
+
+int bind_traced(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    char addr_buf[128];
+    const struct sockaddr *real_addr = addr;
+    if (addr && addrlen > 0 && addrlen <= sizeof(addr_buf)) {
+        memcpy(addr_buf, addr, addrlen);
+        sockaddr_bionic_to_vita((struct sockaddr *)addr_buf, addrlen);
+        real_addr = (struct sockaddr *)addr_buf;
+    }
+    return bind(sockfd, real_addr, addrlen);
+}
+
+ssize_t sendto_traced(int sockfd, const void *buf, size_t len, int flags,
+                       const struct sockaddr *dest_addr, socklen_t addrlen) {
+    char addr_buf[128];
+    const struct sockaddr *real_addr = dest_addr;
+    if (dest_addr && addrlen > 0 && addrlen <= sizeof(addr_buf)) {
+        memcpy(addr_buf, dest_addr, addrlen);
+        sockaddr_bionic_to_vita((struct sockaddr *)addr_buf, addrlen);
+        real_addr = (struct sockaddr *)addr_buf;
+    }
+    return sendto(sockfd, buf, len, msg_flags_bionic_to_vita(flags), real_addr, addrlen);
+}
+
+int accept_traced(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    int ret = accept(sockfd, addr, addrlen);
+    if (ret >= 0 && addr && addrlen) {
+        sockaddr_vita_to_bionic(addr, *addrlen);
+    }
+    return ret;
+}
+
+ssize_t recvfrom_traced(int sockfd, void *buf, size_t len, int flags,
+                         struct sockaddr *src_addr, socklen_t *addrlen) {
+    ssize_t ret = recvfrom(sockfd, buf, len, msg_flags_bionic_to_vita(flags), src_addr, addrlen);
+    if (ret >= 0 && src_addr && addrlen) {
+        sockaddr_vita_to_bionic(src_addr, *addrlen);
+    }
+    return ret;
+}
+
+int getsockname_traced(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    int ret = getsockname(sockfd, addr, addrlen);
+    if (ret == 0 && addr && addrlen) {
+        sockaddr_vita_to_bionic(addr, *addrlen);
+    }
+    return ret;
+}
+
+int getpeername_traced(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    int ret = getpeername(sockfd, addr, addrlen);
+    if (ret == 0 && addr && addrlen) {
+        sockaddr_vita_to_bionic(addr, *addrlen);
+    }
+    return ret;
+}
+// ---------------------------------------------------------------------------
+
 int __atomic_dec(volatile int *ptr) {
     return __sync_fetch_and_sub (ptr, 1);
 }
@@ -219,7 +726,24 @@ void *dlsym_fake(void *restrict handle, const char *restrict symbol) {
     // Usage example:
     // if (strcmp("AMotionEvent_getAxisValue", symbol) == 0)
     //    return &AMotionEvent_getAxisValue;
-    
+
+    // Persistent (non-debug-gated) log, since dlopen() is faked to "succeed"
+    // (see the "dlopen" hook returning ret1 below) -- if the game relies on
+    // dlopen+dlsym for something (e.g. a system libcurl.so), it'll think it
+    // worked and then silently get NULL function pointers from here.
+    {
+        static FILE *dlsym_log = NULL;
+        static int dlsym_log_tried = 0;
+        if (!dlsym_log_tried) {
+            dlsym_log_tried = 1;
+            dlsym_log = gdash_trace_fopen("ux0:data/gdash/dlsym_requests.txt", "w");
+        }
+        if (dlsym_log) {
+            fprintf(dlsym_log, "%s\n", symbol);
+            fflush(dlsym_log);
+        }
+    }
+
     logv_error("Symbol %s not found", symbol);
     return NULL;
 }
@@ -387,34 +911,72 @@ so_default_dynlib default_dynlib[] = {
         { "truncf", (uintptr_t)&truncf },
 
 
+        // Process / signal / misc (needed by OpenSSL entropy seeding
+        // and SIGPIPE handling around send()/recv())
+        { "getpid", (uintptr_t)&getpid },
+        { "getuid", (uintptr_t)&getuid },
+        { "geteuid", (uintptr_t)&geteuid },
+        { "getgid", (uintptr_t)&getgid },
+        { "getegid", (uintptr_t)&getegid },
+        { "socketpair", (uintptr_t)&socketpair },
+        { "fork", (uintptr_t)&fork },
+        { "kill", (uintptr_t)&kill_soloader },
+        { "setuid", (uintptr_t)&setuid },
+        { "setgid", (uintptr_t)&setgid },
+        { "initgroups", (uintptr_t)&initgroups },
+        { "getnameinfo", (uintptr_t)&getnameinfo },
+        { "gai_strerror", (uintptr_t)&gai_strerror },
+        { "basename", (uintptr_t)&basename },
+        { "sigprocmask", (uintptr_t)&sigprocmask_soloader },
+        { "sigsetjmp", (uintptr_t)&sigsetjmp_soloader },
+        { "siglongjmp", (uintptr_t)&siglongjmp_soloader },
+        { "__isnanf", (uintptr_t)&__isnanf },
+        { "__fpclassifyd", (uintptr_t)&__fpclassifyd },
+        { "if_nametoindex", (uintptr_t)&if_nametoindex_soloader },
+        { "syslog", (uintptr_t)&syslog_soloader },
+        { "execl", (uintptr_t)&execl_soloader },
+        { "waitpid", (uintptr_t)&waitpid_soloader },
+        { "umask", (uintptr_t)&umask_soloader },
+        { "dup2", (uintptr_t)&dup2_soloader },
+        { "getpwuid", (uintptr_t)&getpwuid_soloader },
+        { "mprotect", (uintptr_t)&mprotect_soloader },
+        { "mlock", (uintptr_t)&mlock_soloader },
+        { "writev", (uintptr_t)&writev_soloader },
+        { "alarm", (uintptr_t)&alarm_soloader },
+        { "bsearch", (uintptr_t)&bsearch },
+        { "isdigit", (uintptr_t)&isdigit },
+        { "setbuf", (uintptr_t)&setbuf },
+        { "__assert2", (uintptr_t)&__assert2_soloader },
+        { "__gnu_Unwind_Find_exidx", (uintptr_t)&__gnu_Unwind_Find_exidx_soloader },
+
         // Sockets
-        { "accept", (uintptr_t)&accept },
-        { "bind", (uintptr_t)&bind },
-        { "connect", (uintptr_t)&connect },
+        { "accept", (uintptr_t)&accept_traced },
+        { "bind", (uintptr_t)&bind_traced },
+        { "connect", (uintptr_t)&connect_traced },
         { "freeaddrinfo", (uintptr_t)&freeaddrinfo },
-        { "getaddrinfo", (uintptr_t)&getaddrinfo },
+        { "getaddrinfo", (uintptr_t)&getaddrinfo_traced },
         { "gethostbyaddr", (uintptr_t)&gethostbyaddr },
-        { "gethostbyname", (uintptr_t)&gethostbyname },
+        { "gethostbyname", (uintptr_t)&gethostbyname_traced },
         { "gethostname", (uintptr_t)&gethostname },
-        { "getpeername", (uintptr_t)&getpeername },
+        { "getpeername", (uintptr_t)&getpeername_traced },
         { "getservbyname", (uintptr_t)&getservbyname },
-        { "getsockname", (uintptr_t)&getsockname },
-        { "getsockopt", (uintptr_t)&getsockopt },
+        { "getsockname", (uintptr_t)&getsockname_traced },
+        { "getsockopt", (uintptr_t)&getsockopt_soloader },
         { "inet_aton", (uintptr_t)&inet_aton },
         { "inet_ntoa", (uintptr_t)&inet_ntoa },
         { "inet_ntop", (uintptr_t)&inet_ntop },
         { "listen", (uintptr_t)&listen },
         { "poll", (uintptr_t)&poll },
-        { "recv", (uintptr_t)&recv },
-        { "recvfrom", (uintptr_t)&recvfrom },
-        { "recvmsg", (uintptr_t)&recvmsg },
+        { "recv", (uintptr_t)&recv_traced },
+        { "recvfrom", (uintptr_t)&recvfrom_traced },
+        { "recvmsg", (uintptr_t)&recvmsg_traced },
         { "select", (uintptr_t)&select },
-        { "send", (uintptr_t)&send },
-        { "sendmsg", (uintptr_t)&sendmsg },
-        { "sendto", (uintptr_t)&sendto },
-        { "setsockopt", (uintptr_t)&setsockopt },
+        { "send", (uintptr_t)&send_traced },
+        { "sendmsg", (uintptr_t)&sendmsg_traced },
+        { "sendto", (uintptr_t)&sendto_traced },
+        { "setsockopt", (uintptr_t)&setsockopt_soloader },
         { "shutdown", (uintptr_t)&shutdown },
-        { "socket", (uintptr_t)&socket },
+        { "socket", (uintptr_t)&socket_traced },
         
 
         // Memory
@@ -499,7 +1061,7 @@ so_default_dynlib default_dynlib[] = {
             { "ungetwc", (uintptr_t)&ungetwc },
         #endif
 
-        { "access", (uintptr_t)&access },
+        { "access", (uintptr_t)&access_soloader },
         { "chdir", (uintptr_t)&chdir },
         { "chmod", (uintptr_t)&chmod },
         { "dup", (uintptr_t)&dup },
@@ -510,17 +1072,17 @@ so_default_dynlib default_dynlib[] = {
         { "getcwd", (uintptr_t)&getcwd },
         { "lseek", (uintptr_t)&lseek },
         { "lstat", (uintptr_t)&lstat },
-        { "mkdir", (uintptr_t)&mkdir },
+        { "mkdir", (uintptr_t)&mkdir_soloader },
         { "pipe", (uintptr_t)&pipe },
-        { "read", (uintptr_t)&read },
+        { "read", (uintptr_t)&read_traced },
         { "realpath", (uintptr_t)&realpath },
-        { "remove", (uintptr_t)&remove },
-        { "rename", (uintptr_t)&rename },
+        { "remove", (uintptr_t)&remove_soloader },
+        { "rename", (uintptr_t)&rename_soloader },
         { "rewind", (uintptr_t)&rewind },
-        { "rmdir", (uintptr_t)&rmdir },
+        { "rmdir", (uintptr_t)&rmdir_soloader },
         { "truncate", (uintptr_t)&truncate },
-        { "unlink", (uintptr_t)&unlink },
-        { "write", (uintptr_t)&write },
+        { "unlink", (uintptr_t)&unlink_soloader },
+        { "write", (uintptr_t)&write_traced },
 
         // *printf, *scanf
         { "snprintf", (uintptr_t)&snprintf },
@@ -647,10 +1209,13 @@ so_default_dynlib default_dynlib[] = {
         { "glGetError", (uintptr_t)&glGetError },
         { "glGetFloatv", (uintptr_t)&glGetFloatv },
         { "glGetIntegerv", (uintptr_t)&glGetIntegerv },
+        { "glGetBooleanv", (uintptr_t)&glGetBooleanv },
+        { "glIsEnabled", (uintptr_t)&glIsEnabled },
         { "glGetProgramInfoLog", (uintptr_t)&glGetProgramInfoLog },
         { "glGetProgramiv", (uintptr_t)&glGetProgramiv },
         { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLog },
         { "glGetShaderiv", (uintptr_t)&glGetShaderiv },
+        { "glGetShaderSource", (uintptr_t)&glGetShaderSource },
         { "glGetString", (uintptr_t)&glGetString },
         { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
         { "glHint", (uintptr_t)&glHint },
@@ -707,12 +1272,15 @@ so_default_dynlib default_dynlib[] = {
         { "glUniform2f", (uintptr_t)&glUniform2f },
         { "glUniform2fv", (uintptr_t)&glUniform2fv },
         { "glUniform2iv", (uintptr_t)&glUniform2iv },
+        { "glUniform2i", (uintptr_t)&glUniform2i },
         { "glUniform3f", (uintptr_t)&glUniform3f },
         { "glUniform3fv", (uintptr_t)&glUniform3fv },
         { "glUniform3iv", (uintptr_t)&glUniform3iv },
+        { "glUniform3i", (uintptr_t)&glUniform3i },
         { "glUniform4f", (uintptr_t)&glUniform4f },
         { "glUniform4fv", (uintptr_t)&glUniform4fv },
         { "glUniform4iv", (uintptr_t)&glUniform4iv },
+        { "glUniform4i", (uintptr_t)&glUniform4i },
         { "glUniformMatrix2fv", (uintptr_t)&glUniformMatrix2fv },
         { "glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv },
         { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
@@ -861,9 +1429,9 @@ so_default_dynlib default_dynlib[] = {
         // Time
         { "clock", (uintptr_t)&clock },
         { "clock_getres", (uintptr_t)&clock_getres },
-        { "clock_gettime", (uintptr_t)&clock_gettime },
+        { "clock_gettime", (uintptr_t)&clock_gettime_traced },
         { "difftime", (uintptr_t)&difftime },
-        { "gettimeofday", (uintptr_t)&gettimeofday },
+        { "gettimeofday", (uintptr_t)&gettimeofday_traced },
         { "gmtime", (uintptr_t)&gmtime },
         { "gmtime_r", (uintptr_t)&gmtime_r },
         { "localtime", (uintptr_t)&localtime },
@@ -883,7 +1451,7 @@ so_default_dynlib default_dynlib[] = {
 
 
         // stdlib
-        { "abort", (uintptr_t)&abort },
+        { "abort", (uintptr_t)&abort_soloader },
         { "atof", (uintptr_t)&atof },
         { "atoi", (uintptr_t)&atoi },
         { "atol", (uintptr_t)&atol },
@@ -927,7 +1495,7 @@ so_default_dynlib default_dynlib[] = {
 
         // Signals
         { "bsd_signal", (uintptr_t)&signal },
-        { "raise", (uintptr_t)&raise },
+        { "raise", (uintptr_t)&raise_soloader },
         { "sigaction", (uintptr_t)&sigaction },
         
         
@@ -1009,7 +1577,7 @@ so_default_dynlib default_dynlib[] = {
 		{ "sched_yield", (uintptr_t)&sched_yield },
 
         //inet
-        { "inet_pton", (uintptr_t)&inet_pton },
+        { "inet_pton", (uintptr_t)&inet_pton_soloader },
 
         // FMOD
         {"_ZN4FMOD3DSP15getMeteringInfoEP22FMOD_DSP_METERING_INFOS2_", (uintptr_t)&_ZN4FMOD3DSP15getMeteringInfoEP22FMOD_DSP_METERING_INFOS2_},
@@ -1026,53 +1594,53 @@ so_default_dynlib default_dynlib[] = {
         {"_ZN4FMOD6System17setSoftwareFormatEi16FMOD_SPEAKERMODEi", (uintptr_t)&_ZN4FMOD6System17setSoftwareFormatEi16FMOD_SPEAKERMODEi},
         {"_ZN4FMOD6System4initEijPv", (uintptr_t)&_ZN4FMOD6System4initEijPv},
         {"_ZN4FMOD6System18createChannelGroupEPKcPPNS_12ChannelGroupE", (uintptr_t)&_ZN4FMOD6System18createChannelGroupEPKcPPNS_12ChannelGroupE},
-        {"_ZN4FMOD14ChannelControl13setVolumeRampEb", (uintptr_t)&_ZN4FMOD14ChannelControl13setVolumeRampEb},
+        {"_ZN4FMOD14ChannelControl13setVolumeRampEb", (uintptr_t)&gdash_FMOD_setVolumeRamp},
         {"_ZN4FMOD3DSP18setMeteringEnabledEbb", (uintptr_t)&_ZN4FMOD3DSP18setMeteringEnabledEbb},
         {"_ZN4FMOD12ChannelGroup8addGroupEPS0_bPPNS_13DSPConnectionE", (uintptr_t)&_ZN4FMOD12ChannelGroup8addGroupEPS0_bPPNS_13DSPConnectionE},
         {"_ZN4FMOD6System15createDSPByTypeE13FMOD_DSP_TYPEPPNS_3DSPE", (uintptr_t)&_ZN4FMOD6System15createDSPByTypeE13FMOD_DSP_TYPEPPNS_3DSPE},
         {"_ZN4FMOD3DSP16setParameterBoolEib", (uintptr_t)&_ZN4FMOD3DSP16setParameterBoolEib},
         {"_ZN4FMOD14ChannelControl6addDSPEiPNS_3DSPE", (uintptr_t)&_ZN4FMOD14ChannelControl6addDSPEiPNS_3DSPE},
-        {"_ZN4FMOD6System11mixerResumeEv", (uintptr_t)&_ZN4FMOD6System11mixerResumeEv},
+        {"_ZN4FMOD6System11mixerResumeEv", (uintptr_t)&gdash_FMOD_mixerResume},
         {"_ZN4FMOD6System6updateEv", (uintptr_t)&_ZN4FMOD6System6updateEv},
-        {"_ZN4FMOD6System12mixerSuspendEv", (uintptr_t)&_ZN4FMOD6System12mixerSuspendEv},
-        {"_ZN4FMOD14ChannelControl9setPausedEb", (uintptr_t)&_ZN4FMOD14ChannelControl9setPausedEb},
+        {"_ZN4FMOD6System12mixerSuspendEv", (uintptr_t)&gdash_FMOD_mixerSuspend},
+        {"_ZN4FMOD14ChannelControl9setPausedEb", (uintptr_t)&gdash_FMOD_setPaused},
         {"FMOD_Channel_GetFadePoints", (uintptr_t)&FMOD_Channel_GetFadePoints},
         {"FMOD_Channel_GetDSPClock", (uintptr_t)&FMOD_Channel_GetDSPClock},
-        {"_ZN4FMOD14ChannelControl11getDSPClockEPyS1_", (uintptr_t)&_ZN4FMOD14ChannelControl11getDSPClockEPyS1_},
+        {"_ZN4FMOD14ChannelControl11getDSPClockEPyS1_", (uintptr_t)&gdash_FMOD_getDSPClock},
         {"FMOD_Channel_RemoveFadePoints", (uintptr_t)&FMOD_Channel_RemoveFadePoints},
-        {"_ZN4FMOD14ChannelControl9setVolumeEf", (uintptr_t)&_ZN4FMOD14ChannelControl9setVolumeEf},
-        {"_ZN4FMOD5Sound12getOpenStateEP14FMOD_OPENSTATEPjPbS4_", (uintptr_t)&_ZN4FMOD5Sound12getOpenStateEP14FMOD_OPENSTATEPjPbS4_},
-        {"_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE", (uintptr_t)&_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE},
+        {"_ZN4FMOD14ChannelControl9setVolumeEf", (uintptr_t)&gdash_FMOD_setVolume},
+        {"_ZN4FMOD5Sound12getOpenStateEP14FMOD_OPENSTATEPjPbS4_", (uintptr_t)&gdash_FMOD_Sound_getOpenState},
+        {"_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE", (uintptr_t)&gdash_FMOD_System_createStream},
         {"_ZN4FMOD5Sound12setLoopCountEi", (uintptr_t)&_ZN4FMOD5Sound12setLoopCountEi},
         {"_ZN4FMOD5Sound7releaseEv", (uintptr_t)&_ZN4FMOD5Sound7releaseEv},
         {"FMOD_Memory_GetStats", (uintptr_t)&FMOD_Memory_GetStats},
         {"_ZN4FMOD6System11getCPUUsageEP14FMOD_CPU_USAGE", (uintptr_t)&ret0},
-        {"_ZN4FMOD14ChannelControl4stopEv", (uintptr_t)&_ZN4FMOD14ChannelControl4stopEv},
+        {"_ZN4FMOD14ChannelControl4stopEv", (uintptr_t)&gdash_FMOD_stop},
         {"_ZN4FMOD6System5closeEv", (uintptr_t)&_ZN4FMOD6System5closeEv},
         {"_ZN4FMOD6System7releaseEv", (uintptr_t)&_ZN4FMOD6System7releaseEv},
         {"_ZN4FMOD12ChannelGroup7releaseEv", (uintptr_t)&_ZN4FMOD12ChannelGroup7releaseEv},
         {"FMOD_System_LockDSP", (uintptr_t)&FMOD_System_LockDSP},
         {"_ZN4FMOD7Channel13getLoopPointsEPjjS1_j", (uintptr_t)&_ZN4FMOD7Channel13getLoopPointsEPjjS1_j},
-        {"_ZN4FMOD7Channel11getPositionEPjj", (uintptr_t)&_ZN4FMOD7Channel11getPositionEPjj},
+        {"_ZN4FMOD7Channel11getPositionEPjj", (uintptr_t)&gdash_FMOD_getPosition},
         {"FMOD_Channel_GetDelay", (uintptr_t)&FMOD_Channel_GetDelay},
         {"FMOD_System_UnlockDSP", (uintptr_t)&FMOD_System_UnlockDSP},
         {"_ZN4FMOD14ChannelControl11setUserDataEPv", (uintptr_t)&_ZN4FMOD14ChannelControl11setUserDataEPv},
         {"_ZN4FMOD14ChannelControl9getVolumeEPf", (uintptr_t)&_ZN4FMOD14ChannelControl9getVolumeEPf},
         {"_ZN4FMOD14ChannelControl8getPitchEPf", (uintptr_t)&_ZN4FMOD14ChannelControl8getPitchEPf},
-        {"_ZN4FMOD7Channel11setPositionEjj", (uintptr_t)&_ZN4FMOD7Channel11setPositionEjj},
+        {"_ZN4FMOD7Channel11setPositionEjj", (uintptr_t)&gdash_FMOD_setPosition},
         {"_ZN4FMOD7Channel15getCurrentSoundEPPNS_5SoundE", (uintptr_t)&_ZN4FMOD7Channel15getCurrentSoundEPPNS_5SoundE},
-        {"_ZN4FMOD5Sound9getLengthEPjj", (uintptr_t)&_ZN4FMOD5Sound9getLengthEPjj},
-        {"_ZN4FMOD14ChannelControl8setPitchEf", (uintptr_t)&_ZN4FMOD14ChannelControl8setPitchEf},
+        {"_ZN4FMOD5Sound9getLengthEPjj", (uintptr_t)&gdash_FMOD_getLength},
+        {"_ZN4FMOD14ChannelControl8setPitchEf", (uintptr_t)&gdash_FMOD_setPitch},
         {"_ZN4FMOD14ChannelControl9getPausedEPb", (uintptr_t)&_ZN4FMOD14ChannelControl9getPausedEPb},
-        {"_ZN4FMOD14ChannelControl12addFadePointEyf", (uintptr_t)&_ZN4FMOD14ChannelControl12addFadePointEyf},
+        {"_ZN4FMOD14ChannelControl12addFadePointEyf", (uintptr_t)&gdash_FMOD_addFadePoint},
         {"_ZN4FMOD7Channel12setLoopCountEi", (uintptr_t)&_ZN4FMOD7Channel12setLoopCountEi},
-        {"_ZN4FMOD14ChannelControl8setDelayEyyb", (uintptr_t)&_ZN4FMOD14ChannelControl8setDelayEyyb},
+        {"_ZN4FMOD14ChannelControl8setDelayEyyb", (uintptr_t)&gdash_FMOD_setDelay},
         {"_ZN4FMOD7Channel13setLoopPointsEjjjj", (uintptr_t)&_ZN4FMOD7Channel13setLoopPointsEjjjj},
-        {"_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE", (uintptr_t)&_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE},
+        {"_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE", (uintptr_t)&gdash_FMOD_System_playSound},
         {"_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E", (uintptr_t)&_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E},
         {"_ZN4FMOD12ChannelGroup14getNumChannelsEPi", (uintptr_t)&_ZN4FMOD12ChannelGroup14getNumChannelsEPi},
         {"_ZN4FMOD12ChannelGroup10getChannelEiPPNS_7ChannelE", (uintptr_t)&_ZN4FMOD12ChannelGroup10getChannelEiPPNS_7ChannelE},
-        {"_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE", (uintptr_t)&_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE},
+        {"_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE", (uintptr_t)&gdash_FMOD_System_createSound},
         {"_ZN4FMOD6System7lockDSPEv", (uintptr_t)&_ZN4FMOD6System7lockDSPEv},
         {"_ZN4FMOD6System9unlockDSPEv", (uintptr_t)&_ZN4FMOD6System9unlockDSPEv},
         {"_ZN4FMOD14ChannelControl10getNumDSPsEPi", (uintptr_t)&_ZN4FMOD14ChannelControl10getNumDSPsEPi},
@@ -1085,6 +1653,22 @@ void resolve_imports(so_module* mod) {
     __sF_fake[0] = *stdin;
     __sF_fake[1] = *stdout;
     __sF_fake[2] = *stderr;
+
+    {
+        FILE *f = gdash_trace_fopen("ux0:data/gdash/hook_addrs.txt", "w");
+        if (f) {
+            fprintf(f, "connect_traced=%p\n", (void*)&connect_traced);
+            fprintf(f, "socket_traced=%p\n", (void*)&socket_traced);
+            fprintf(f, "getaddrinfo_traced=%p\n", (void*)&getaddrinfo_traced);
+            fprintf(f, "fcntl_soloader=%p\n", (void*)&fcntl_soloader);
+            fprintf(f, "real connect()=%p\n", (void*)&connect);
+            fprintf(f, "real socket()=%p\n", (void*)&socket);
+            fprintf(f, "setsockopt_soloader=%p\n", (void*)&setsockopt_soloader);
+            fprintf(f, "getsockopt_soloader=%p\n", (void*)&getsockopt_soloader);
+            fprintf(f, "ioctl_soloader=%p\n", (void*)&ioctl_soloader);
+            fclose(f);
+        }
+    }
 
     so_resolve(mod, default_dynlib, sizeof(default_dynlib), 0);
 }

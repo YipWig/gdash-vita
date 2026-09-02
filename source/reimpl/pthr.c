@@ -14,6 +14,7 @@
  * of the MIT license. See the LICENSE file for details.
  */
 
+#include "utils/trace.h"
 #include "reimpl/pthr.h"
 
 #include <stdlib.h>
@@ -24,6 +25,15 @@
 
 #include "utils/utils.h"
 #include "utils/logger.h"
+#include <stdio.h>
+#include <errno.h>
+
+static FILE *pthr_trace_file(void) {
+    static FILE *f = NULL;
+    static int tried = 0;
+    if (!tried) { tried = 1; f = gdash_trace_fopen("ux0:data/gdash/pthread_trace.txt", "w"); }
+    return f;
+}
 
 #define  BIONIC_PTHREAD_COND_INITIALIZER              0
 #define  BIONIC_PTHREAD_MUTEX_INITIALIZER             0
@@ -186,44 +196,75 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
         ret = pthread_create(thread, attr->real_ptr, start, param);
     }
 
+    FILE *tf = pthr_trace_file();
+    if (tf) { fprintf(tf, "pthread_create(start=%p) = %d (thread=%p)\n", (void*)start, ret, thread ? (void*)*thread : NULL); fflush(tf); }
+
     return ret;
 }
 
-int pthread_rwlock_init_soloader(pthread_rwlock_t *rwlock, const pthread_rwlockattr_t *attr) { 
-    pthread_rwlock_t *rw = calloc(1, sizeof(pthread_rwlock_t));
-    if (!rw)
-        return -1;
-
-    *rw = PTHREAD_RWLOCK_INITIALIZER;
-
-    int ret = pthread_rwlock_init(rw, attr);
-    if (ret < 0) {
-        free(rw);
-        return -1;
+// BUG (found while tracking down a reproducible OPENSSL_die()/abort()
+// during the game's first TLS handshake -- BoringSSL's CRYPTO_MUTEX,
+// used pervasively for one-time crypto/EVP init, is built directly on
+// pthread_rwlock): vitasdk's real pthread_rwlock_* functions all take a
+// plain `pthread_rwlock_t *lock` (matching our own soloader signatures
+// exactly, since pthread_rwlock_t is itself already a pointer type here)
+// -- but the previous version of this file added an extra, unnecessary
+// level of indirection in init (allocating a wrapper and storing a
+// pointer-to-the-handle where a plain handle was expected), and worse,
+// pthread_rwlock_unlock_soloader() actually DESTROYED AND FREED the
+// entire rwlock on every single unlock call, then set the caller's own
+// storage to NULL. Any lock still considered valid by its owner (BoringSSL
+// keeps long-lived rwlocks for exactly this kind of one-time-init
+// bookkeeping) would be silently destroyed after its very first unlock,
+// so the next lock/unlock anywhere on that same object hit a NULL/freed
+// handle -- exactly the kind of internal corruption that trips
+// BoringSSL's own consistency checks and calls OPENSSL_die(). Forward
+// directly to the real implementation for all five, with no destroy
+// piggybacked onto unlock.
+static FILE *rwlock_trace_file(void) {
+    static FILE *f = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        f = gdash_trace_fopen("ux0:data/gdash/rwlock_trace.txt", "w");
     }
+    return f;
+}
 
-    *rwlock = rw;
-    return 0;
+int pthread_rwlock_init_soloader(pthread_rwlock_t *rwlock, const pthread_rwlockattr_t *attr) {
+    if (!rwlock)
+        return -1;
+    *rwlock = PTHREAD_RWLOCK_INITIALIZER;
+    int ret = pthread_rwlock_init(rwlock, attr);
+    FILE *f = rwlock_trace_file();
+    if (f) { fprintf(f, "init(rwlock=%p, attr=%p) = %d (errno=%d) *rwlock=%p from=%p\n",
+                      (void*)rwlock, (void*)attr, ret, errno, (void*)*rwlock, __builtin_return_address(0)); fflush(f); }
+    return ret;
 }
 
 int pthread_rwlock_rdlock_soloader(pthread_rwlock_t *rwlock) {
-    return pthread_rwlock_rdlock(rwlock);
+    int ret = pthread_rwlock_rdlock(rwlock);
+    FILE *f = rwlock_trace_file();
+    if (f) { fprintf(f, "rdlock(rwlock=%p) = %d (errno=%d) *rwlock=%p from=%p\n",
+                      (void*)rwlock, ret, errno, rwlock ? (void*)*rwlock : NULL, __builtin_return_address(0)); fflush(f); }
+    return ret;
 }
 
 int pthread_rwlock_wrlock_soloader(pthread_rwlock_t *rwlock) {
-    return pthread_rwlock_wrlock(rwlock);
+    int ret = pthread_rwlock_wrlock(rwlock);
+    FILE *f = rwlock_trace_file();
+    if (f) { fprintf(f, "wrlock(rwlock=%p) = %d (errno=%d) *rwlock=%p from=%p\n",
+                      (void*)rwlock, ret, errno, rwlock ? (void*)*rwlock : NULL, __builtin_return_address(0)); fflush(f); }
+    return ret;
 }
 
 int pthread_rwlock_unlock_soloader(pthread_rwlock_t *rwlock) {
-    if (!rwlock || !(*rwlock))
+    if (!rwlock)
         return -1;
-
-    int ret = pthread_rwlock_unlock(*rwlock);
-    pthread_rwlock_destroy_soloader(*rwlock);
-
-    free(*rwlock);
-    *rwlock = NULL;
-
+    int ret = pthread_rwlock_unlock(rwlock);
+    FILE *f = rwlock_trace_file();
+    if (f) { fprintf(f, "unlock(rwlock=%p) = %d (errno=%d) *rwlock=%p from=%p\n",
+                      (void*)rwlock, ret, errno, (void*)*rwlock, __builtin_return_address(0)); fflush(f); }
     return ret;
 }
 
@@ -231,7 +272,11 @@ int pthread_rwlock_destroy_soloader(pthread_rwlock_t *rwlock) {
     if (!rwlock)
         return -1;
 
-    return pthread_rwlock_destroy(rwlock);
+    int ret = pthread_rwlock_destroy(rwlock);
+    FILE *f = rwlock_trace_file();
+    if (f) { fprintf(f, "destroy(rwlock=%p) = %d (errno=%d) from=%p\n",
+                      (void*)rwlock, ret, errno, __builtin_return_address(0)); fflush(f); }
+    return ret;
 }
 
 int pthread_mutexattr_init_soloader(pthread_mutexattr_t *attr)
@@ -332,6 +377,9 @@ int pthread_cond_signal_soloader(pthread_cond_t_bionic *cond)
 
     _cond_t_static_init(cond, NULL);
 
+    FILE *tf = pthr_trace_file();
+    if (tf) { fprintf(tf, "cond_signal(cond=%p)\n", (void*)cond); fflush(tf); }
+
     return pthread_cond_signal(cond->real_ptr);
 }
 
@@ -353,7 +401,11 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
     _cond_t_static_init(cond, NULL);
     _mutex_t_static_init(mutex, NULL);
 
-    return pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
+    FILE *tf = pthr_trace_file();
+    if (tf) { fprintf(tf, "cond_wait(cond=%p) starting...\n", (void*)cond); fflush(tf); }
+    int ret = pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
+    if (tf) { fprintf(tf, "cond_wait(cond=%p) = %d\n", (void*)cond, ret); fflush(tf); }
+    return ret;
 }
 
 int pthread_cond_broadcast_soloader(pthread_cond_t_bionic *cond)
@@ -428,11 +480,44 @@ pthread_t pthread_self_soloader()
     return pthread_self();
 }
 
+// BUG (this is almost certainly THE actual root cause behind the whole
+// "OPENSSL_die: assertion failed: ssl_digest_methods[SSL_MD_MD5_IDX] !=
+// NULL" crash): this only ever did a test-and-set to pick ONE thread to
+// run init_routine(), then let every other (losing) thread return
+// IMMEDIATELY -- without waiting for the winner to actually finish.
+// bionic's real pthread_once() guarantees every caller only returns
+// once initialization has FULLY completed. BoringSSL's ssl_load_ciphers()
+// is guarded by exactly this kind of once-check when populating its
+// static ssl_digest_methods[] table; GD's background networking thread
+// and another thread (main, or another crypto path) can both hit this
+// at nearly the same time -- with the old code, the losing thread would
+// sail straight through into ssl_load_ciphers() while the winning
+// thread's init_routine() was still mid-populate on the other core,
+// finding the table only partially filled in and hitting the assert.
+// Use a proper 3-state (not-started/in-progress/done) flag and make
+// losers actually wait.
 int pthread_once_soloader(volatile int *once_control, void (*init_routine)(void)) {
     if (!once_control || !init_routine)
         return -1;
-    if (__sync_lock_test_and_set(once_control, 1) == 0)
+
+    static FILE *tf = NULL;
+    static int tried = 0;
+    if (!tried) { tried = 1; tf = gdash_trace_fopen("ux0:data/gdash/once_trace.txt", "w"); }
+    if (tf) { fprintf(tf, "pthread_once(ctrl=%p, init=%p) *ctrl=%d\n", (void*)once_control, (void*)init_routine, *once_control); fflush(tf); }
+
+    if (__sync_bool_compare_and_swap(once_control, 0, 1)) {
+        if (tf) { fprintf(tf, "  -> WINNER, running init %p\n", (void*)init_routine); fflush(tf); }
         (*init_routine)();
+        __sync_synchronize();
+        *once_control = 2;
+        if (tf) { fprintf(tf, "  <- WINNER done %p\n", (void*)init_routine); fflush(tf); }
+    } else {
+        if (tf) { fprintf(tf, "  -> WAITING for %p\n", (void*)init_routine); fflush(tf); }
+        while (*once_control != 2) {
+            sceKernelDelayThread(100);
+        }
+        if (tf) { fprintf(tf, "  <- done waiting for %p\n", (void*)init_routine); fflush(tf); }
+    }
     return 0;
 }
 

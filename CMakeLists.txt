@@ -29,6 +29,11 @@ set(ASSETS_PATH "ux0:data/gdash/assets/" CACHE STRING "Path to assets folder (wi
 set(APK_PATH "${DATA_PATH}GeometryDash.apk" CACHE STRING "Path to data (with trailing /)")
 set(SO_PATH "${DATA_PATH}libcocos2dcpp.so" CACHE STRING "Path to .so")
 
+option(GDASH_TRACE "Write diagnostic trace files to ux0:data/gdash/" OFF)
+if (GDASH_TRACE)
+  add_definitions(-DGDASH_TRACE=1)
+endif()
+
 option(USE_SCELIBC_IO "Use SceLibcBridge for IO and some other std functions" ON)
 if (USE_SCELIBC_IO)
   add_definitions(-DUSE_SCELIBC_IO)
@@ -49,8 +54,9 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
 endif()
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -I${CMAKE_SOURCE_DIR}/vitasdk_fmod_include")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -g -std=gnu++20 -Wno-write-strings -Wno-psabi")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-q -Wl,-z,max-page-size=0x20000 -Wl,-z,common-page-size=0x20000")
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
@@ -66,9 +72,13 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/log.c
                source/reimpl/mem.c
                source/reimpl/pthr.c
+               source/reimpl/proc_stubs.c
+               source/reimpl/sockaddr_abi.c
+               source/reimpl/sockopt.c
                source/reimpl/sys.c
                source/utils/dialog.c
                source/utils/glutil.c
+               source/utils/nosplash.c
                source/utils/init.c
                source/utils/logger.c
                source/utils/settings.c
@@ -91,12 +101,13 @@ target_include_directories(${CMAKE_PROJECT_NAME}
                            PUBLIC ${CMAKE_SOURCE_DIR}/source
                            )
 
+target_link_directories(${CMAKE_PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/vitasdk_fmod_include)
 target_link_libraries(${CMAKE_PROJECT_NAME}
-                      -Wl,--whole-archive pthread -Wl,--no-whole-archive -Wl,-q,--wrap,FMOD_System_CreateSound,--wrap,FMOD_System_CreateStream
+                      -Wl,--allow-multiple-definition -Wl,--whole-archive pthread -Wl,--no-whole-archive -Wl,-q,--wrap,FMOD_System_CreateSound,--wrap,FMOD_System_CreateStream
                       ssl
                       crypto
-                      stdc++
                       vitaGL
+                      stdc++
                       vitashark
                       SceShaccCgExt
                       taihen_stub
@@ -125,6 +136,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       ScePower_stub
                       SceTouch_stub
                       SceVshBridge_stub
+                      SceNetCtl_stub
+                      SceNet_stub
                   )
 
 

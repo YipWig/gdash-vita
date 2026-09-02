@@ -460,7 +460,48 @@ int so_resolve(so_module *mod, so_default_dynlib *default_dynlib, int size_defau
                         }
                     }
 
+#if GDASH_TRACE
+                    // One-off targeted resolution log for the networking
+                    // symbols we're actively debugging, so we know for sure
+                    // what address each PLT slot ended up with (and via
+                    // which mechanism), independent of runtime call tracing.
+                    {
+                        const char *nm = mod->dynstr + sym->st_name;
+                        if (strcmp(nm, "connect") == 0 || strcmp(nm, "socket") == 0 ||
+                            strcmp(nm, "fcntl") == 0 || strcmp(nm, "getaddrinfo") == 0 ||
+                            strcmp(nm, "close") == 0 || strcmp(nm, "setsockopt") == 0) {
+                            static FILE *resolve_log = NULL;
+                            static int resolve_log_tried = 0;
+                            if (!resolve_log_tried) {
+                                resolve_log_tried = 1;
+                                resolve_log = fopen("ux0:data/gdash/resolve_trace.txt", "w");
+                            }
+                            if (resolve_log) {
+                                fprintf(resolve_log, "%s: reloc_type=%d resolved=%d final_ptr_value=0x%08x (slot_addr=%p)\n",
+                                        nm, type, resolved, (unsigned)*ptr, (void*)ptr);
+                                fflush(resolve_log);
+                            }
+                        }
+                    }
+
+#endif
                     if (!resolved) {
+#if GDASH_TRACE
+                        // Persistent (non-debug-gated) log so unresolved symbols
+                        // are visible on real hardware without a UART/debug setup.
+                        {
+                            static FILE *unresolved_log = NULL;
+                            static int unresolved_log_tried = 0;
+                            if (!unresolved_log_tried) {
+                                unresolved_log_tried = 1;
+                                unresolved_log = fopen("ux0:data/gdash/unresolved_imports.txt", "w");
+                            }
+                            if (unresolved_log) {
+                                fprintf(unresolved_log, "%s\n", mod->dynstr + sym->st_name);
+                                fflush(unresolved_log);
+                            }
+                        }
+#endif
                         if (type == R_ARM_JUMP_SLOT) {
                             printf("Unresolved import: %s\n", mod->dynstr + sym->st_name);
                             *ptr = (uintptr_t)&plt0_stub;

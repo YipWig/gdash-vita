@@ -15,6 +15,10 @@ Geometry Dash · PS Vita Port
   <a href="#license">License</a>
 </p>
 
+
+> **This fork: online features & custom-song playback.**  
+> Compared to upstream, this fork makes the online part of the game work on real hardware (profile, featured/search, level download, song download from the servers) and plays custom songs inside levels. Downloaded songs are stored in `ux0:data/gdash/songs/<id>.mp3` (the folder is created automatically). The vitaGL boot splash has also been removed. See [What changed](#what-changed-in-this-fork) for the technical details.
+
 # About
 
 Geometry Dash is a side-scrolling music platforming game series developed by RobTop. The game is known for it's challenging levels and legacy, garnering millions of players and a passionate fanbase making user levels to this day.
@@ -46,7 +50,7 @@ for Android in form of an `.apk` file. [You can get all the required files direc
 - Open the `.apk` with any zip explorer (like [7-Zip](https://www.7-zip.org/)) and extract every single audio file and folders `sfx` and `songs` from the `.apk` into `ux0:data/gdash/assets`. Example of resulting path: `ux0:data/gdash/assets/songs/10000104.ogg`, `ux0:data/gdash/assets/menuLoop.mp3`.
 - Obtain the `.so` file called `libcocos2dcpp.so` from the `.apk` and place it in `ux0:data/gdash/`.
 - Place the `.apk` file in `ux0:data/gdash/` and rename as `GeometryDash.apk`.
-- Install `gdash.vpk` (from [Releases](https://github.com/hatoving/gdash-vita/releases/latest)).
+- Install `gdash.vpk` (from [Releases](https://github.com/YipWig/gdash-vita/releases/latest)).
 
 # Controls
 
@@ -74,6 +78,19 @@ Additionally, you'll need vitaGl to be compiled with these flags: ``make HAVE_GL
 
 You also have to install FMOD onto your VitaSDK enviroment. Info on how to acquire the stubs needed will need to be taken care of by yourself; `fmodpp` can be installed via the already-available precompiled library file found [here](https://github.com/Rinnegatamante/fmodpp/tree/master/build_sfp).
 
+This fork looks for FMOD in a local `vitasdk_fmod_include/` directory instead of the global VitaSDK tree (it is added to the include and link paths by `CMakeLists.txt`):
+
+```
+vitasdk_fmod_include/
+  fmod/                  <- the FMOD Studio API headers (fmod.h, fmod_common.h, ...), from the FMOD SDK (not redistributed here)
+  libfmodpp.a            <- Rinnegatamante's fmodpp (softfp build)
+  libfmodstudio_stub.a   <- import stub generated from libfmodstudio.suprx with vita-libs-gen
+```
+
+Only the FMOD headers are missing from the repo for licensing reasons: copy them from the FMOD Engine SDK (`api/core/inc` and `api/studio/inc`) into `vitasdk_fmod_include/fmod/`.
+
+Diagnostic tracing (files written to `ux0:data/gdash/*_trace.txt`) is compiled out by default; enable it with `cmake -DGDASH_TRACE=ON`.
+
 After all these requirements are met, you can compile the loader with the following commands:
 
 ```bash
@@ -89,7 +106,17 @@ cmake --build build --target dump # Fetch latest coredump and parse
 
 For more information and build options, read the [CMakeLists.txt](CMakeLists.txt).
 
-## Credits
+#
+# What changed in this fork
+
+- **OpenSSL**: the `.so` ships its own statically-linked OpenSSL 1.1.x. Upstream redirected many of its `EVP_*` / `CRYPTO_*` / `ERR_*` entry points into vitasdk's separate libcrypto, which left the game's OpenSSL with an empty cipher/digest table ("library has no ciphers", "x509 verification setup problems"). Only the allocator, `OPENSSL_cleanse`, `CRYPTO_memcmp` and `CRYPTO_atomic_add` (which otherwise uses the Linux kuser helper at `0xffff0fc0`) are hooked now (`source/openssl_patch.c`).
+- **libc bridge**: a failed `fopen` left `errno == 0`, so OpenSSL treated the missing `openssl.cnf` as a fatal config error instead of "file not found" (`source/reimpl/io.c`).
+- **bionic ↔ Vita socket ABI**: `AF_INET6` (10 vs 28) made `inet_pton` fail so curl never sent SNI and Cloudflare aborted the TLS handshake; bionic `MSG_NOSIGNAL` (0x4000) passed to Vita `send()` failed with errno 106 on song downloads. Both are translated in `source/dynlib.c` / `source/reimpl/sockopt.c` / `sockaddr_abi.c`.
+- **Song storage**: `getCocos2dxWritablePath` is implemented (`source/falso_jni_impl.c`) and every file API translates the Android data prefix to `ux0:data/gdash/`, so songs land in `ux0:data/gdash/songs/<id>.mp3` and are found again on the next launch.
+- **Music in levels**: the game drives FMOD through its C++ API, so those symbols are redirected to wrappers in `source/main.c`. Level music starts with a 2 s fade-in via `Channel::addFadePoint`, which never raises the volume on the Vita FMOD build, so fade points are ignored; `setPosition` is clamped (negative music offsets, positions past the end).
+- **Misc**: keyboard input goes through the Android text-input JNI flow (`nativeInsertText`/`nativeTextClosed`), `ioctl(FIONBIO/FIONREAD)` and a few pthread/process stubs are implemented, and the vitaGL boot splash is disabled (`source/utils/nosplash.c`).
+
+# Credits
 - [Andy "The FloW" Nguyen](https://github.com/TheOfficialFloW/) for the original .so loader.
 - [Rinnegatamante](https://github.com/Rinnegatamante/) and [gl33ntwine](https://github.com/v-atamanenko/) for helping me a ton with the port (+ for vitaGL by Rinnegatamante.)
 - [CatoTheYounger97](https://github.com/CatoTheYounger97/), [Dexxtrip](https://www.reddit.com/user/Dexxtrip/) and [withLogic](https://github.com/withLogic/) for testing the game out.

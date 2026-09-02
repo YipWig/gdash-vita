@@ -4,3 +4,18 @@ build/*
 cmake-build-*/
 lib/libc_bridge/out/
 apk/
+
+# Proprietary bits: FMOD SDK headers and the Sony/FMOD PRX extracted from a game
+vitasdk_fmod_include/fmod/
+libfmodstudio.suprx
+libfmodstudio.elf
+# local scratch
+*.vpk
+*.apk
+*.tar.gz
+fmod_dumper.*
+fmod_names.txt
+fmodpp_needed.txt
+libc.suprx
+libfios2.suprx
+libshacccg.suprx

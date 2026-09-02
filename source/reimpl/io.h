@@ -96,3 +96,10 @@ int fcntl_soloader(int fd, int cmd, ...);
 #endif
 
 #endif // SOLOADER_IO_H
+
+int access_soloader(const char *path, int mode);
+int remove_soloader(const char *path);
+int unlink_soloader(const char *path);
+int rmdir_soloader(const char *path);
+int mkdir_soloader(const char *path, int mode);
+int rename_soloader(const char *a, const char *b);
