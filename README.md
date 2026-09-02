@@ -18,7 +18,7 @@ Geometry Dash · PS Vita Port
 
 > **This fork: online features & custom-song playback.**  
 > Compared to upstream, this fork makes the online part of the game work on real hardware (profile, featured/search, level download, song download from the servers) and plays custom songs inside levels. Downloaded songs are stored in `ux0:data/gdash/songs/<id>.mp3` (the folder is created automatically). The vitaGL boot splash has also been removed. See [What changed](#what-changed-in-this-fork) for the technical details.
-
+Claude was used to help during this project as i'm definitely not a developer.
 # About
 
 Geometry Dash is a side-scrolling music platforming game series developed by RobTop. The game is known for it's challenging levels and legacy, garnering millions of players and a passionate fanbase making user levels to this day.
