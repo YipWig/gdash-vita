@@ -18,7 +18,9 @@ Geometry Dash · PS Vita Port
 
 > **This fork: online features & custom-song playback.**  
 > Compared to upstream, this fork makes the online part of the game work on real hardware (profile, featured/search, level download, song download from the servers) and plays custom songs inside levels. Downloaded songs are stored in `ux0:data/gdash/songs/<id>.mp3` (the folder is created automatically). The vitaGL boot splash has also been removed. See [What changed](#what-changed-in-this-fork) for the technical details.
-Claude was used to help during this project as i'm definitely not a developer.
+>
+> Claude was used to help during this project as i'm definitely not a developer.
+
 # About
 
 Geometry Dash is a side-scrolling music platforming game series developed by RobTop. The game is known for it's challenging levels and legacy, garnering millions of players and a passionate fanbase making user levels to this day.
@@ -114,6 +116,7 @@ For more information and build options, read the [CMakeLists.txt](CMakeLists.txt
 - **bionic ↔ Vita socket ABI**: `AF_INET6` (10 vs 28) made `inet_pton` fail so curl never sent SNI and Cloudflare aborted the TLS handshake; bionic `MSG_NOSIGNAL` (0x4000) passed to Vita `send()` failed with errno 106 on song downloads. Both are translated in `source/dynlib.c` / `source/reimpl/sockopt.c` / `sockaddr_abi.c`.
 - **Song storage**: `getCocos2dxWritablePath` is implemented (`source/falso_jni_impl.c`) and every file API translates the Android data prefix to `ux0:data/gdash/`, so songs land in `ux0:data/gdash/songs/<id>.mp3` and are found again on the next launch.
 - **Music in levels**: the game drives FMOD through its C++ API, so those symbols are redirected to wrappers in `source/main.c`. Level music starts with a 2 s fade-in via `Channel::addFadePoint`, which never raises the volume on the Vita FMOD build, so fade points are ignored; `setPosition` is clamped (negative music offsets, positions past the end).
+- **Chest / daily timers**: bionic clock ids are translated (`CLOCK_REALTIME` is 0 on Android but 1 on the Vita, so `clock_gettime(0)` failed and the timers showed "24092 days").
 - **Misc**: keyboard input goes through the Android text-input JNI flow (`nativeInsertText`/`nativeTextClosed`), `ioctl(FIONBIO/FIONREAD)` and a few pthread/process stubs are implemented, and the vitaGL boot splash is disabled (`source/utils/nosplash.c`).
 
 # Credits

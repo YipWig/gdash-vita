@@ -603,8 +603,39 @@ static void clock_trace_check(const char *who, clockid_t clk_id, long sec, long 
     }
 }
 
+// bionic clock ids differ from newlib's: CLOCK_REALTIME is 0 on Android but
+// 1 on the Vita (0 is CLOCK_REALTIME_COARSE, which newlib rejects with EINVAL
+// and leaves *tp untouched). RewardsPage::updateTimers does
+// "chest_time - clock_gettime(0)" and displayed garbage ("24092 days").
+static clockid_t clockid_bionic_to_vita(clockid_t id) {
+    switch (id) {
+        case 0:  return CLOCK_REALTIME;            // CLOCK_REALTIME
+        case 1:  return CLOCK_MONOTONIC;           // CLOCK_MONOTONIC
+        case 2:  return CLOCK_MONOTONIC;           // CLOCK_PROCESS_CPUTIME_ID (unsupported)
+        case 3:  return CLOCK_MONOTONIC;           // CLOCK_THREAD_CPUTIME_ID (unsupported)
+        case 4:  return CLOCK_MONOTONIC_RAW;       // CLOCK_MONOTONIC_RAW
+        case 5:  return CLOCK_REALTIME;            // CLOCK_REALTIME_COARSE
+        case 6:  return CLOCK_MONOTONIC;           // CLOCK_MONOTONIC_COARSE
+        case 7:  return CLOCK_MONOTONIC;           // CLOCK_BOOTTIME
+        default: return CLOCK_REALTIME;
+    }
+}
+
+int clock_getres_soloader(clockid_t clk_id, struct timespec *res) {
+    return clock_getres(clockid_bionic_to_vita(clk_id), res);
+}
+
 int clock_gettime_traced(clockid_t clk_id, struct timespec *tp) {
-    int ret = clock_gettime(clk_id, tp);
+    int ret = clock_gettime(clockid_bionic_to_vita(clk_id), tp);
+    if (ret != 0 && tp) {
+        // Never leave the caller with an uninitialised timespec.
+        struct timeval tv;
+        if (gettimeofday(&tv, NULL) == 0) {
+            tp->tv_sec = tv.tv_sec;
+            tp->tv_nsec = (long)tv.tv_usec * 1000;
+            ret = 0;
+        }
+    }
     if (ret == 0 && tp) clock_trace_check("clock_gettime", clk_id, tp->tv_sec, tp->tv_nsec);
     return ret;
 }
@@ -614,6 +645,58 @@ int gettimeofday_traced(struct timeval *tv, void *tz) {
     if (ret == 0 && tv) clock_trace_check("gettimeofday", (clockid_t)6 /* own bucket */, tv->tv_sec, (long)tv->tv_usec * 1000);
     return ret;
 }
+
+#if GDASH_TRACE
+// Chest / daily timers show "24092 days": log the wall-clock APIs the game
+// uses for them, with the calling address inside the .so.
+extern so_module so_mod;
+static FILE *time_trace_file(void) {
+    static FILE *f = NULL; static int tried = 0;
+    if (!tried) { tried = 1; f = gdash_trace_fopen("ux0:data/gdash/time_trace.txt", "w"); }
+    return f;
+}
+#define TT_CALLER ((unsigned)__builtin_return_address(0) - (unsigned)so_mod.text_base)
+time_t time_traced(time_t *t) {
+    time_t r = time(t);
+    static int n = 0; static time_t last = 0;
+    if (time_trace_file() && (n < 40 || r - last >= 30 || r < last)) {
+        n++; last = r;
+        fprintf(time_trace_file(), "time() = %ld caller=so+0x%x\n", (long)r, TT_CALLER); fflush(time_trace_file());
+    }
+    return r;
+}
+double difftime_traced(time_t a, time_t b) {
+    double r = difftime(a, b);
+    if (time_trace_file()) { fprintf(time_trace_file(), "difftime(%ld, %ld) = %f caller=so+0x%x\n", (long)a, (long)b, r, TT_CALLER); fflush(time_trace_file()); }
+    return r;
+}
+struct tm *gmtime_traced(const time_t *t) {
+    struct tm *r = gmtime(t);
+    if (time_trace_file()) { fprintf(time_trace_file(), "gmtime(%ld) -> %04d-%02d-%02d %02d:%02d:%02d caller=so+0x%x\n", t ? (long)*t : -1L,
+        r ? r->tm_year + 1900 : 0, r ? r->tm_mon + 1 : 0, r ? r->tm_mday : 0, r ? r->tm_hour : 0, r ? r->tm_min : 0, r ? r->tm_sec : 0, TT_CALLER); fflush(time_trace_file()); }
+    return r;
+}
+struct tm *gmtime_r_traced(const time_t *t, struct tm *out) {
+    struct tm *r = gmtime_r(t, out);
+    if (time_trace_file()) { fprintf(time_trace_file(), "gmtime_r(%ld) -> %04d-%02d-%02d %02d:%02d:%02d caller=so+0x%x\n", t ? (long)*t : -1L,
+        r ? r->tm_year + 1900 : 0, r ? r->tm_mon + 1 : 0, r ? r->tm_mday : 0, r ? r->tm_hour : 0, r ? r->tm_min : 0, r ? r->tm_sec : 0, TT_CALLER); fflush(time_trace_file()); }
+    return r;
+}
+clock_t clock_traced(void) {
+    clock_t r = clock();
+    static int n = 0;
+    if (time_trace_file() && n++ < 20) { fprintf(time_trace_file(), "clock() = %ld caller=so+0x%x\n", (long)r, TT_CALLER); fflush(time_trace_file()); }
+    return r;
+}
+size_t strftime_traced(char *s, size_t max, const char *fmt, const struct tm *tm) {
+    size_t r = strftime(s, max, fmt, tm);
+    if (time_trace_file()) { fprintf(time_trace_file(), "strftime(\"%s\") = \"%s\" (tm %04d-%02d-%02d) caller=so+0x%x\n", fmt, r ? s : "", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, TT_CALLER); fflush(time_trace_file()); }
+    return r;
+}
+#define TIME_FN(x) x##_traced
+#else
+#define TIME_FN(x) x
+#endif
 // ---------------------------------------------------------------------------
 
 ssize_t sendmsg_traced(int sockfd, const struct msghdr *msg, int flags) {
@@ -1427,19 +1510,19 @@ so_default_dynlib default_dynlib[] = {
 
 
         // Time
-        { "clock", (uintptr_t)&clock },
-        { "clock_getres", (uintptr_t)&clock_getres },
+        { "clock", (uintptr_t)&TIME_FN(clock) },
+        { "clock_getres", (uintptr_t)&clock_getres_soloader },
         { "clock_gettime", (uintptr_t)&clock_gettime_traced },
-        { "difftime", (uintptr_t)&difftime },
+        { "difftime", (uintptr_t)&TIME_FN(difftime) },
         { "gettimeofday", (uintptr_t)&gettimeofday_traced },
-        { "gmtime", (uintptr_t)&gmtime },
-        { "gmtime_r", (uintptr_t)&gmtime_r },
+        { "gmtime", (uintptr_t)&TIME_FN(gmtime) },
+        { "gmtime_r", (uintptr_t)&TIME_FN(gmtime_r) },
         { "localtime", (uintptr_t)&localtime },
         { "localtime_r", (uintptr_t)&localtime_r },
         { "mktime", (uintptr_t)&mktime },
         { "nanosleep", (uintptr_t)&nanosleep },
-        { "strftime", (uintptr_t)&strftime },
-        { "time", (uintptr_t)&time },
+        { "strftime", (uintptr_t)&TIME_FN(strftime) },
+        { "time", (uintptr_t)&TIME_FN(time) },
         { "tzset", (uintptr_t)&tzset },
 
 
